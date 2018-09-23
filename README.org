@@ -1,0 +1,310 @@
+* What are continuations
+   :PROPERTIES:
+   :CREATED:  [2017-09-18 Mon 08:26]
+   :header-args: :session cl-continuations :tangle /tmp/cl-continuations.cl
+   :EXPORT_FILE_NAME: /tmp/CLContinuations
+   :END:
+
+Taken from the sensational "On Lisp" by Paul Graham (pg. 258).
+
+A continuation is a closure containing all the functions called up
+until this point. It gives context to a computation. The cool thing is
+that this context can be used to step back in time and rerun the
+function with different parameters!
+
+Common Lisp is an extremely malleable language, and in the following
+we will study some macros to add continuations support to the
+language.
+
+The continuation closure is originally an identity:
+
+#+BEGIN_SRC lisp
+(setq *cont* #'identity)
+#+END_SRC
+
+#+RESULTS:
+: #<FUNCTION IDENTITY>
+
+We define a macro to define lambdas that can handle
+continuations:
+#+BEGIN_SRC lisp
+(defmacro =lambda (parms &body body)
+  `#'(lambda (*cont* ,@parms) ,@body)) ;; *cont* is added by the macro to pass the continuation
+#+END_SRC
+
+#+RESULTS:
+: =LAMBDA
+
+We define a macro to declare a function which will handle
+continuations:
+
+#+BEGIN_SRC lisp
+(defmacro =defun (name parms &body body)
+  (let ((f (intern (concatenate 'string "=" (symbol-name name)))))
+    `(progn
+       (defmacro ,name ,parms
+         `(,' ,f *cont* ,,@parms))
+       (defun ,f (*cont* ,@parms) ,@body))))
+#+END_SRC
+
+#+RESULTS:
+: =DEFUN
+
+The ==defun= macro generates a macro and a function that can handle
+continuation. The macro will have the name of the function we define
+with ==defun= and will invoke the generated function.
+
+For example:
+
+#+BEGIN_SRC lisp :results drawer
+(macroexpand '(=defun add1 (x) x))
+;; => (PROGN (DEFMACRO ADD1 (X) `(,'=ADD1 *CONT* ,X)) (DEFUN =ADD1 (*CONT* X) X))
+#+END_SRC
+
+#+RESULTS:
+:RESULTS:
+(PROGN (DEFMACRO ADD1 (X) `(,'=ADD1 *CONT* ,X)) (DEFUN =ADD1 (*CONT* X) X))
+T
+:END:
+
+We can also define a bind operator to run an action with the
+current continuation before it is modified by further steps:
+
+#+BEGIN_SRC lisp
+(defmacro =bind (parms expr &body body)
+  `(let ((*cont* #'(lambda ,parms ,@body))) ,expr))
+#+END_SRC
+
+#+RESULTS:
+: =BIND
+
+Then we want to define an operators that returns the values of a
+continuation-based function:
+
+#+BEGIN_SRC lisp
+(defmacro =values (&rest retvals)
+  `(funcall *cont* ,@retvals))
+#+END_SRC
+
+#+RESULTS:
+: =VALUES
+
+Naturally, it is the continuation that establish the function
+returned: we need the computation context to know how to handle the
+=retvals=.
+
+For example ==values= expands to:
+
+#+BEGIN_SRC lisp :results drawer
+(macroexpand '(=values (1+ n)))
+;; => (FUNCALL *CONT* (1+ N))
+#+END_SRC
+
+And it can be used like so:
+
+#+BEGIN_SRC lisp :results drawer
+(=defun bar (x) (=values (list 'a (1+ x))))
+(bar 5)
+
+(=defun message ()
+  (=values 'hello 'there))
+#+END_SRC
+
+#+RESULTS:
+:RESULTS:
+=MESSAGE
+:END:
+
+An example of the combination of ==bind= and ==values= may be:
+
+#+BEGIN_SRC lisp :results drawer
+(=defun baz ()
+  (=bind (m n) (message)
+    (=values (list m n))))
+
+(baz)
+;; => (HELLO THERE)
+#+END_SRC
+
+#+RESULTS:
+:RESULTS:
+(HELLO THERE)
+:END:
+
+Also we need to make ==lambda= work properly:
+
+#+BEGIN_SRC lisp
+(defmacro =funcall (fn &rest args)
+  `(funcall ,fn *cont* ,@args))
+
+(defmacro =apply (fn &rest args)
+  `(apply ,fn *cont* ,@args))
+#+END_SRC
+
+#+RESULTS:
+: =APPLY
+
+Now we can use ==lambda= as =lambda=:
+
+#+BEGIN_SRC lisp
+(=defun add1 (x) 
+  (=values (1+ x)))
+
+(let ((fn (=lambda (n) (add1 n))))
+  (=bind (y) (=funcall fn 9)
+    (format nil "9 + 1 = ~A" y)))
+;; => 9 + 1 = 10
+#+END_SRC
+
+#+RESULTS:
+: 9 + 1 = 10
+
+Cool. We now have the core macros to support our continuations passing
+style.
+
+Let's finally look at a very interesting example where continuations
+shine: nondeterminism.
+
+Say that we are given a question and have multiple answers: would not
+be cool if we could try all the answers until we find the one? Let's
+do that.
+
+Let's define the paths (all our possibilities):
+#+BEGIN_SRC lisp
+(defparameter *paths* nil)
+#+END_SRC
+
+#+RESULTS:
+: *PATHS*
+
+And a failure:
+
+#+BEGIN_SRC lisp
+(defconstant failsym '@)
+#+END_SRC
+
+#+RESULTS:
+: FAILSYM
+
+Now we define the choice operator:
+
+#+BEGIN_SRC lisp
+(defmacro choose (&rest choices)
+  (if choices
+    `(progn
+      ,@(mapcar #'(lambda (c)
+                    `(push #'(lambda () ,c) *paths*))
+                (reverse (cdr choices)))
+      ,(car choices))
+    '(fail)))
+#+END_SRC
+
+#+RESULTS:
+: CHOOSE
+
+Let's try =choose= out:
+
+#+BEGIN_SRC lisp
+(defun do2 (x)
+  (choose (+ x 2) (* x 2) (expt x 2)))
+
+(do2 3)
+;; => 5
+#+END_SRC
+
+#+RESULTS:
+: 5
+
+Now what about defining how to fail:
+
+#+BEGIN_SRC lisp
+(defun fail ()
+  (if *paths*
+    (funcall (pop *paths*))
+    failsym))
+#+END_SRC
+
+#+RESULTS:
+: FAIL
+
+Now our example can work nondeterministically:
+#+BEGIN_SRC lisp
+(fail)
+;; => 9
+#+END_SRC
+
+#+RESULTS:
+: 9
+
+We can define also a binding operator for choose:
+
+#+BEGIN_SRC lisp
+(defmacro choose-bind (var choices &body body)
+  `(cb #'(lambda (,var) ,@body) ,choices))
+
+(defun cb (fn choices)
+  (if choices
+    (progn
+      (if (cdr choices)
+          (push #'(lambda () (cb fn (cdr choices)))
+                ,*paths*))
+      (funcall fn (car choices)))
+    (fail)))
+#+END_SRC
+
+#+RESULTS:
+: CB
+
+We can use =choose-bind= to bind the chosen value to a symbol, eg:
+
+#+BEGIN_SRC lisp
+(choose-bind x '(marrakesh strasbourg vegas)
+  (format nil "Let's go to ~A." x))
+;; => Let's go to MARRAKESH.
+#+END_SRC
+
+#+RESULTS:
+: Let's go to MARRAKESH.
+
+#+BEGIN_SRC lisp
+(fail)
+;; => Let's go to STRASBOURG.
+#+END_SRC
+
+#+RESULTS:
+: Let's go to STRASBOURG.
+
+Now we can merge the continuation with our choice:
+
+#+BEGIN_SRC lisp :results drawer
+(=defun two-numbers ()
+  (choose-bind n1 '(0 1 2 3 4 5)
+    (choose-bind n2 '(0 1 2 3 4 5)
+      (=values n1 n2))))
+
+(=defun parlor-trick (sum)
+  (=bind (n1 n2) (two-numbers)
+    (if (= (+ n1 n2) sum)
+      `(the sum of ,n1 ,n2)
+      (fail)))) ;; we try until all choices are exhausted
+
+(parlor-trick 7)
+;; => (THE SUM OF 2 5)
+(parlor-trick 8)
+;; => (THE SUM OF 3 5)
+(parlor-trick 1)
+;; => (THE SUM OF 0 1)
+#+END_SRC
+
+#+RESULTS:
+:RESULTS:
+(THE SUM OF 0 1)
+:END:
+
+The trick is in the =(=values n1 n2)= which get expanded in the
+continuation application. The continuation is formed by the two
+=choose-bind=, which contain the previous continuation. This creates a
+loop that gets exhausted only if the =if= statement is satisfied.
+
+That is just great!
+
